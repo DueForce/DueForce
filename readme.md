@@ -2,7 +2,7 @@
 
 ## Overview
 
-Repo for anonymous submission of the work : Define-Use Guided Path Exploration for Better Forced Execution
+Repo for "Define-Use Guided Path Exploration for Better Forced Execution" (in ISSTA'2024). The code will be ready soon.
 
 ## Architecture 
 
