@@ -11,6 +11,4 @@ Repo for anonymous submission of the work : Define-Use Guided Path Exploration f
 ## Components 
 
 - `MalwareAnalysis.pdf`: details of malware analysis result
-- `data`: experimental results on SPECINT2000 and malwares
-  - SPECINT2000: each folder includes the running statistics of the specific program
-  - Malware: each folder includes the behaviors exposed by DueForce, PMP and BDA$^*$ of the specific malware
+- `DueForce.pdf`: camere-ready version of the paper
