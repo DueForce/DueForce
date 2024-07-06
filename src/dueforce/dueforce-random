@@ -1,0 +1,1181 @@
+#!/usr/bin/env python
+
+import os
+import socket
+import subprocess
+import sys
+import time
+import random
+import bisect
+import math
+from collections import deque
+
+from dueforce_execution import Execution, trim_callstack
+from dueforce_ground import GroundTruth
+from ducg_path import find_inter_path
+
+BREAKPOINT = {}
+
+BLACKHOLE = {}
+
+def main():
+  seed = random.randint(0, 0xffffffff)
+  os.environ['RANDOM_SEED'] = str(seed)
+  random.seed(seed)
+  do_init()
+  print("SEED = %u" % seed)
+  if DO_FORK == True:
+    explore_random_fork()
+
+def reverse_graph(G) :
+  iG = {}
+  for _from in G.keys() :
+    for _to in G[_from] :
+      if _to not in iG :
+        iG[_to] = set()
+      iG[_to].add(_from)
+  return iG 
+
+def handle_mem_write(curr_key, next_key, GBlk2MemWrite, blk2def_addr, M2I) :
+  if curr_key not in blk2def_addr : 
+    return
+  for mem_item in blk2def_addr[curr_key] :
+      if mem_item not in M2I : 
+        M2I[mem_item] = set()
+      M2I[mem_item].add(curr_key)
+  return 
+
+def handle_mem_read(curr_key, blk2use_addr, M2I, DIP) :
+  if curr_key not in blk2use_addr :
+    return 
+  curr_blk = curr_key[1]
+  for mem_addr in blk2use_addr[curr_key] :
+    if mem_addr not in M2I : continue
+    for def_blk in M2I[mem_addr] :
+      if curr_blk != def_blk[1] :
+        DIP.add((curr_blk, def_blk[1]))
+
+def memmap_merge(dest, src) :
+  flag = False
+  for key in src.keys() :
+    if len(src[key]) == 0 : 
+      continue
+    if key in dest :
+      if not src[key].issubset(dest[key]) :
+        dest[key] = dest[key].union(src[key])
+        flag = True
+    else :
+      dest[key] = set().union(src[key])
+      flag = True
+
+  return flag
+
+def get_succs(blk, icfg, type) :
+  succs = []
+  if blk not in icfg :
+    return succs
+  if type == "CALL" :
+    for succ in icfg[blk] :
+      if succ in GroundTruth.func_all :
+        succs.append(succ)
+  elif type == "RET" :
+    for succ in icfg[blk] :
+      if succ in GroundTruth.block_all and succ not in GroundTruth.func_all :
+        succs.append(succ)
+  else :
+    succs = icfg[blk]
+  return succs
+
+def posterior_analysis(ICFG, succ_closure, call_depth) :
+  global PS
+
+  WL = deque()
+  inq = set()
+
+  print("[+] begin to calc the new memory write")
+  for key in Execution.blk2def_addr :
+    if (key not in Execution.GBlk2MemWrite) or (not Execution.blk2def_addr[key].issubset(Execution.GBlk2MemWrite[key])) :
+      WL.append(key)
+      inq.add(key)
+
+  print("[+] begin to analyze")
+  analysis_cnt = 0
+  while len(WL) > 0 :
+    curr_key = WL.popleft()
+    inq.discard(curr_key)
+
+    succs = succ_closure[curr_key] if curr_key in succ_closure else set()
+    for next_key in succs :
+      ''' when curr_blk is a call blk, only call_target need to be update by curr_blk '''
+      if next_key not in PS : 
+        PS[next_key] = {}
+      handle_mem_write(curr_key = curr_key, next_key = next_key, GBlk2MemWrite = Execution.GBlk2MemWrite, blk2def_addr = Execution.blk2def_addr, M2I = PS[next_key])
+      analysis_cnt += len(Execution.blk2def_addr[curr_key])
+
+  for blk in Execution.blk2def_addr :
+    if blk not in Execution.GBlk2MemWrite :
+      Execution.GBlk2MemWrite[blk] = set().union(Execution.blk2def_addr[blk])
+    else :
+      Execution.GBlk2MemWrite[blk].update(Execution.blk2def_addr[blk])
+  print("analysis count : %d" % analysis_cnt)
+
+def walk_on_iCFG(blk, cs, depth) :
+  if depth == 0 :
+    return blk, cs, "CFG"
+  type = None
+  if GroundTruth.is_call_blk(blk) == True :
+    cs.append(blk)
+    type = "CALL"
+  elif GroundTruth.is_ret_blk(blk) == True :
+    blk = cs.pop()
+    type = "RET"
+  else :
+    type = "CFG"
+  return blk, cs, type
+
+def get_succ_closure(ICFG, call_depth) :
+  WL = deque()
+  inq = set()
+
+  _succ_closure = {}
+
+  entry_point = ("main", GroundTruth.main)
+  WL.append(entry_point)
+  inq.add(entry_point)
+
+  analysis_cnt = 0
+  while len(WL) > 0 :
+    analysis_cnt += 1
+    if (analysis_cnt >= 7800 * 3900) :
+      assert(False)
+    curr_cs, curr_blk = WL.popleft()
+    call_stack = curr_cs.split("||")
+    curr_cs = trim_callstack(callstack = call_stack, depth = call_depth)
+    curr_key = (curr_cs, curr_blk)
+    inq.discard(curr_key)
+
+    if curr_key not in _succ_closure :
+      _succ_closure[curr_key] = set()
+    _succ_closure[curr_key].add(curr_key)
+
+    curr_set = _succ_closure[curr_key]
+    # print(curr_key)
+
+    curr_blk, call_stack, type = walk_on_iCFG(blk = curr_blk, cs = call_stack, depth = call_depth)
+    next_cs = trim_callstack(callstack = call_stack, depth = call_depth)
+    succs = get_succs(blk = curr_blk, icfg = ICFG, type = type)
+
+    for next_blk in sorted(succs, key = str.lower) :
+      # when curr_blk is a call blk, only call_target need to be update by curr_blk
+      next_state = ("||".join(call_stack), next_blk)
+      next_key = (next_cs, next_blk)
+      if next_key not in _succ_closure : 
+        _succ_closure[next_key] = set()
+      if not curr_set.issubset(_succ_closure[next_key]) :
+        _succ_closure[next_key].update(curr_set)
+        if next_key not in inq:
+          inq.add(next_key)
+          WL.append(next_state)
+
+  print(analysis_cnt)
+  print(len(_succ_closure))
+  succ_closure = {}
+  for key in _succ_closure :
+    for prev in _succ_closure[key] :
+      if prev not in succ_closure :
+        succ_closure[prev] = set()
+      succ_closure[prev].add(key)
+
+  return succ_closure
+
+def get_key_succ_closure(key, ICFG, call_depth, succ_closure, LIMIT ) :
+  WL = deque()
+  dis = {}
+
+  _succ_closure = {}
+
+  WL.append(key)
+
+  analysis_cnt = 0
+  while len(WL) > 0 :
+    curr_cs, curr_blk = WL.popleft()
+    # print("original : ", curr_cs, curr_blk)
+    call_stack = curr_cs.split("||")
+    curr_cs = trim_callstack(callstack = call_stack, depth = call_depth)
+    curr_key = (curr_cs, curr_blk)
+    if curr_key not in dis :
+      dis[curr_key] = 0
+    ''' restore when partial-context-sensitive '''
+    # inq.discard(curr_key)
+    # inq.add(curr_key)
+
+    if curr_key not in _succ_closure :
+      _succ_closure[curr_key] = set()
+    _succ_closure[curr_key].add(curr_key)
+
+    curr_set = _succ_closure[curr_key]
+
+    if call_depth != 0 :
+      curr_blk, call_stack, type = walk_on_iCFG(blk = curr_blk, cs = call_stack, depth = call_depth)
+    else :
+      type = 'CFG'
+    next_cs = trim_callstack(callstack = call_stack, depth = call_depth)
+    succs = get_succs(blk = curr_blk, icfg = ICFG, type = type)
+    # print("after walk : ", curr_key, type, succs)
+
+    analysis_cnt += len(succs)
+    for next_blk in succs :
+      # when curr_blk is a call blk, only call_target need to be update by curr_blk
+      next_state = ("||".join(call_stack), next_blk)
+      next_key = (next_cs, next_blk)
+      # if next_key in succ_closure :
+      #   inq.update(succ_closure[next_key])
+      if next_key not in dis:
+        dis[next_key] = dis[curr_key] + 1
+        if LIMIT <= 0 or dis[next_key] <= LIMIT :
+          WL.append(next_state)
+
+  # print("analysis_cnt : ", analysis_cnt)
+  return dis.keys()
+
+def do_init():
+  global DUMP_INSN
+  global DUMP_CG
+  global DUMP_DEP
+  global DUMP_MEM
+
+  global DO_FORK
+  global DO_STATS
+  global DO_GRAPH
+  global DO_COMPARE
+
+  global DO_EXPLOIT 
+  global DO_BDA
+  global DO_KILL
+  global DO_GROUND
+
+  global ROOT
+  global WORKDIR
+  global HOOK
+  global ANALYSIS
+
+  global DATA
+  global ERROR
+  global BUG
+
+  global TARGET
+  global QEMU
+  global RUNANALYSIS
+  global RUNRANDOM
+  global QEMU_MODE
+  global BENCHMARK
+
+  DUMP_INSN = True if os.environ.get("DUMP_INSN")=="True" else False
+  DUMP_CG = True if os.environ.get("DUMP_CG")=="True" else False
+  DUMP_DEP = True if os.environ.get("DUMP_DEP")=="True" else False
+  DUMP_MEM = True if os.environ.get("DUMP_MEM")=="True" else False
+
+  DO_FORK = True if os.environ.get("DO_FORK")=="True" else False
+  DO_STATS = True if os.environ.get("DO_STATS")=="True" else False
+  DO_GRAPH = True if os.environ.get("DO_GRAPH")=="True" else False
+  DO_COMPARE = True if os.environ.get("DO_COMPARE")=="True" else False
+
+  DO_EXPLOIT = True if os.environ.get("DO_EXPLOIT")=="True" else False
+  DO_KILL = True if os.environ.get("DO_KILL")=="True" else False
+  DO_GROUND = True if os.environ.get("DO_GROUND")=="True" else False
+  DO_BDA = True if os.environ.get("DO_BDA")=="True" else False
+
+  QEMU_MODE = "dueforce"
+  BENCHMARK = os.environ.get("BENCHMARK")
+  print("QEMU_MODE = %s" % QEMU_MODE)
+
+  ROOT = os.environ.get("ROOT")
+  WORKDIR = os.environ.get("WORKDIR")
+  HOOK = "%s/hook" % ROOT
+  ANALYSIS = "%s/analysis/analysis.sh" % ROOT
+
+  DATA = "%s/data" % WORKDIR
+  ERROR = "%s/error" % WORKDIR
+  BUG = "%s/bug" % WORKDIR
+
+  TARGET = sys.argv[1]
+  QEMU = "%s/qemu/exe-%s/bin/qemu-x86_64" % (ROOT, QEMU_MODE)
+  RUNANALYSIS = "%s %s" % (ANALYSIS, TARGET)
+  RUNRANDOM = "%s -E LD_PRELOAD=%s/libhook-%s.so -- %s" % (QEMU, HOOK, QEMU_MODE, TARGET)
+
+  GroundTruth.do_cls_init(work_dir = WORKDIR)
+  Execution.do_cls_init(work_dir = WORKDIR)
+
+def exploration_select_and_mutate(worklist) :
+  global fitness
+  new_scheme = None
+  candidate_predicates = None
+  insn_cov = Execution.insn_cov
+  while len(worklist) > 0 :
+
+    path_scheme, preds = worklist[-1]
+
+    candidate_tmp = []
+    for (insn, target) in preds.copy() :
+
+      if insn not in insn_cov :
+        print(insn, len(insn_cov))
+      assert(insn in insn_cov)
+      if insn in BLACKHOLE :
+        preds.discard((insn, target))
+        continue
+      if target == 'T' or target == 'F' :
+        branches = GroundTruth.get_predicate_branch(insn)
+        target_insn = branches[target == 'T']
+        if (target_insn not in insn_cov) and ((insn, ['T', 'F'][target == 'T']) not in fitness):
+          candidate_tmp.append((insn, ['T', 'F'][target == 'T']))
+        else :
+          preds.discard((insn, target))
+      elif insn in GroundTruth.jmptab :
+        for _target in GroundTruth.jmptab[insn]:
+          if not (_target == target) and (not _target in insn_cov):
+            candidate_tmp.append((insn, _target))
+      elif insn in GroundTruth.calltab :
+        for _target in GroundTruth.calltab[insn]:
+          if not (_target == target) and (not _target in insn_cov):
+            candidate_tmp.append((insn, _target))
+      else :
+        preds.discard((insn, target))
+
+    if len(candidate_tmp) == 0 :
+      worklist.pop()
+      continue
+    new_scheme = list(path_scheme)
+    candidate_predicates = candidate_tmp
+    break
+          
+  if candidate_predicates is None :
+    return None
+  size = len(candidate_predicates)
+  if "twolf" in TARGET :
+    index = -1
+  else :
+    index = random.randint(0, size - 1)
+  new_scheme.append(candidate_predicates[index])
+  fitness.add(candidate_predicates[index])
+  return new_scheme
+
+def exploitation_select(exec_history, weights) :
+  if len(exec_history) == 0 :
+    return None, None
+  pivot = random.randint(0, len(exec_history) - 1)
+  return pivot, exec_history[pivot]
+  global selected_times 
+  while True :
+    if sum(weights) == 0 : 
+      return None, None
+    pivot = weighted_select(weight=weights)
+    if weights[pivot] > 0 and selected_times[pivot] < 300:
+      selected_times[pivot] += 1
+      print("weight of select: ", weights[pivot])
+      return pivot, exec_history[pivot]
+    else :
+      exec_history.pop(pivot)
+      weights.pop(pivot)
+
+def random_select_and_mutate(exec_history) :
+  pivot = random.randint(0, len(exec_history) - 1)
+  candidates = []
+  scheme, preds, _ = exec_history[pivot]
+  preds_set = set(preds)
+  for (insn, target) in preds :
+
+    if target in BLACKHOLE :
+      preds.discard((insn, target))
+      continue
+    if target == 'T' or target == 'F' :
+      new_switch = (insn, 'T') if target == 'F' else (insn, 'F')
+      if new_switch not in preds_set :
+        candidates.append(new_switch)
+    else:
+      if insn in GroundTruth.jmptab :
+        for _target in GroundTruth.jmptab[insn] :
+          if _target != target :
+            candidates.append((insn, _target))
+      if insn in GroundTruth.calltab :
+        for _target in GroundTruth.calltab[insn] :
+          if _target != target :
+            candidates.append((insn, _target))
+
+  if len(candidates) == 0 :
+    return None
+  pivot = random.randint(0, len(candidates) - 1)
+  return scheme + [candidates[pivot]]
+
+def weighted_select(weight, topK = 50) :
+  topK_set = set()
+  for index, w in enumerate(weight) :
+    topK_set.add((w, index))
+  if len(weight) > topK :
+    topK_list = sorted(topK_set)[-topK:]
+  else :
+    topK_list = sorted(topK_set)
+
+  sum = []
+  lstw = 0
+  for w in topK_list :
+    sum.append(w[0] + lstw)
+    lstw = sum[-1]
+  tmp = random.random() * (sum[-1])
+  pivot = bisect.bisect_right(sum, tmp - 0.0001) # make sure pivot will not out-of-bound
+  print(topK_list[pivot][1], len(weight))
+  return topK_list[pivot][1]
+
+def calc_distance_with_single_source(graph, entry, type) :
+  dis = {}
+  dis[entry] = 0
+  que = deque([entry])
+  while len(que) > 0 :
+    curr_node = que.popleft()
+    if curr_node not in graph :
+      continue
+    for next_node in graph[curr_node] :
+      if next_node not in dis :
+        if type == "BLOCK" and len(graph[curr_node]) == 1 :
+          dis[next_node] = dis[curr_node]
+        else :
+          dis[next_node] = dis[curr_node] + 1
+        que.append(next_node)
+  return dis
+
+def get_distance(alpha = 10) :
+  global max_dis
+  global CFGraph
+  global CGraph
+
+  CGraph = {}
+  CFGraph = {}
+  caller_list = {}
+  cg_all = GroundTruth.cg_all
+  cfg_all = GroundTruth.cfg_edges
+  func_all = GroundTruth.func_all
+  block_all = GroundTruth.block_all
+  caller2callee = GroundTruth.caller2callee
+  func_map = GroundTruth.func_map
+  i2f = GroundTruth.i2f
+  max_dis = 0
+
+  for (u, v) in cg_all :
+    if u not in CGraph :
+      CGraph[u] = set()
+    CGraph[u].add(v)
+  for (u, v) in cfg_all :
+    if u not in CFGraph :
+      CFGraph[u] = set()
+    CFGraph[u].add(v)
+
+  func_distance = {}
+  block_distance = {}
+
+  if DO_EXPLOIT == False :
+    return block_distance
+
+  for func in func_all :
+    func_distance[func] = calc_distance_with_single_source(graph = CGraph, entry = func, type = "FUNC")
+  for block in block_all :
+    block_distance[block] = calc_distance_with_single_source(graph = CFGraph, entry = block, type = "BLOCK")
+  for caller_site, callee_entries in caller2callee.items() :
+    for callee_entry in callee_entries :
+      if caller_site not in block_all :
+        continue
+      for func in func_distance[callee_entry] :
+        if func not in block_distance[caller_site] :
+          block_distance[caller_site][func] = func_distance[callee_entry][func] * alpha
+        else :
+          block_distance[caller_site][func] = min(block_distance[caller_site][func], func_distance[callee_entry][func] * alpha)
+
+        if (i2f[caller_site], func) not in caller_list :
+          caller_list[(i2f[caller_site], func)] = set()
+        caller_list[(i2f[caller_site], func)].add(caller_site)
+
+  for curr_func in func_all :
+    for curr_block in func_map[curr_func] : # src bb
+      for next_func in func_distance[curr_func] :
+        if next_func == curr_func : 
+          continue
+        assert((curr_func, next_func) in caller_list)
+        for caller_block in caller_list[(curr_func, next_func)] :
+          if caller_block not in block_distance[curr_block] :
+            continue
+          if next_func not in block_distance[curr_block] :
+            block_distance[curr_block][next_func] = block_distance[curr_block][caller_block] + block_distance[caller_block][next_func]
+          else :
+            block_distance[curr_block][next_func] = min(block_distance[curr_block][next_func], 
+                                                        block_distance[curr_block][caller_block] + block_distance[caller_block][next_func])
+          for next_block in func_map[next_func] :
+            if next_block not in block_distance[curr_block] :
+              block_distance[curr_block][next_block] = block_distance[curr_block][next_func] + block_distance[next_func][next_block] 
+            else :
+              block_distance[curr_block][next_block] = min(block_distance[curr_block][next_block],
+                                                           block_distance[curr_block][next_func] + block_distance[next_func][next_block])
+          max_dis = max(max_dis, block_distance[curr_block][next_func])
+  max_dis += 1
+  return block_distance
+
+def get_suffixs(bb_dis) :
+  suffixs = {}
+  block_all = GroundTruth.block_all
+  for bb0 in block_all :
+    suffixs[bb0] = set()
+    for bb1 in block_all :
+      if calc_distance_between_blocks(block_distance = bb_dis, blk0 = bb0, blk1 = bb1) is not None :
+        suffixs[bb0].add(bb1)
+  return suffixs
+
+def calc_distance_between_blocks(block_distance, blk0, blk1) :
+  if (blk0 is None) or (blk1 is None) :
+    return None
+  if blk1 in block_distance[blk0] :
+    return block_distance[blk0][blk1]
+  return None
+
+def get_weight_of_execution(execution, def2use, back_adj, block_distance, depth) :
+
+  def get_succ(cs_insn, back_adj, i2b) :
+    succs = set()
+    blk = None
+    insn = cs_insn[1]
+    key = cs_insn[1] # context insensitive
+    # key = cs_insn # context sensitive
+    if key in back_adj :
+      succs = back_adj[key] 
+      blk = i2b[insn]
+    return succs, blk
+
+  scheme, preds, trace = execution
+  candidate_branch = []
+  candidate_weight = []
+  candidate_pairs = []
+  i2b = GroundTruth.i2b
+  i = 0
+  weight = {}
+  weight_set = {}
+  insn_cov = Execution.insn_cov
+  call_stack = ["main"]
+  curr_blk = None
+  for (insn, target) in preds :
+    tmp_pairs = []
+    tmp_weight = 0
+    tmp_cnt = 1
+    while i < len(trace):
+      _, call_stack, __ = walk_on_iCFG(blk = trace[i], cs = call_stack, depth = depth)
+      if trace[i] in def2use :
+        for use in def2use[trace[i]] :
+          if use not in weight : 
+            weight[use] = 0
+            weight_set[use] = set()
+          weight[use] += 1
+          weight_set[use].add(trace[i])
+      if i2b[insn] == trace[i] :
+        i += 1
+        break
+      i += 1
+
+    if insn not in insn_cov :
+      print("%s not in insn_cov" % (insn))
+
+    ''' DO NOT CHANGE THE BLACKHOLE '''
+    if insn in BLACKHOLE :
+      continue
+    assert(insn in insn_cov)
+
+    curr_cs = trim_callstack(callstack = call_stack, depth = depth)
+    if target == 'T' or target == 'F' :
+
+      new_switch = (insn, ['T', 'F'][target == 'T'])
+      if new_switch in scheme : 
+        continue
+
+      branches = GroundTruth.get_predicate_branch(insn)
+      branch0 = branches[target == 'T'] # forced target branch
+      branch1 = branches[target == 'F'] # original target branch
+      succ_force, blk_force = get_succ(cs_insn=(curr_cs, branch0), back_adj=back_adj, i2b=i2b)
+    else :
+      new_switch = (insn, target)
+      succ_force, blk_force = get_succ(cs_insn=(curr_cs, target), back_adj=back_adj, i2b=i2b)
+    for succ_blk in succ_force : # context insensitive
+      if succ_blk in weight :
+        tmp_val = calc_distance_between_blocks(block_distance=block_distance, blk0=blk_force, blk1=succ_blk)
+        if tmp_val is None : continue
+        tmp_val = (1.0 - 1.0*(tmp_val+1)/max_dis) if (tmp_val is not None) else 0
+        tmp_weight = max(tmp_weight, tmp_val)
+        tmp_cnt += 1#weight[succ_blk]
+        for def_blk in weight_set[succ_blk] :
+          tmp_pairs.append((def_blk, succ_blk, tmp_val))
+    if tmp_weight != 0: 
+      candidate_branch.append(new_switch)
+      candidate_weight.append(1.0 * tmp_weight)
+      candidate_pairs.append(tmp_pairs)
+  assert (len(candidate_weight) == len(candidate_branch))
+  if len(candidate_weight) == 0 : candidate_weight.append(0)
+  return candidate_branch, candidate_weight, candidate_pairs
+
+def DUCG_exeuction(execution, def2use, block_distance) :
+  global CFGraph
+  global CGraph
+
+  scheme, preds, trace = execution
+  i2b = GroundTruth.i2b
+  trace_index = 0
+  use2def = {}
+  new_scheme = list(scheme)
+  pred_set = set()
+
+  target_pair = None
+  target_dis  = None
+  target_index = None
+  target_debug = None
+
+  for pred_index, (pred_insn, _) in enumerate(preds) :
+    while trace_index < len(trace):
+      def_bb = trace[trace_index]
+      if def_bb in def2use :
+        for use in def2use[def_bb] :
+          if use not in use2def : 
+            use2def[use] = set()
+          use2def[use].add(def_bb)
+      trace_index += 1
+      if i2b[pred_insn] == def_bb :
+        break
+    for use_bb in use2def.keys() :
+      tmp_dis = calc_distance_between_blocks(block_distance = block_distance, blk0 = i2b[pred_insn], blk1 = i2b[use_bb])
+      if tmp_dis is not None : 
+        if (target_dis is None) or (target_dis > tmp_dis) :
+          target_dis = tmp_dis
+          target_pair = (i2b[pred_insn], i2b[use_bb])
+          target_index = pred_index
+          target_debug = set()
+          for def_bb in use2def[use_bb] :
+            target_debug.add((use_bb, def_bb))
+
+  if target_index is None :
+    return None, None
+
+  print("[+] select {}<-{}, contribution : {}".format(target_pair[1], target_pair[0], target_debug))
+  force_path = find_inter_path(
+    CFG = CFGraph,
+    CG = CGraph,
+    caller2callee = GroundTruth.caller2callee,
+    block_distance = block_distance,
+    target = target_pair,
+    i2f = GroundTruth.i2f,
+    func_all = GroundTruth.func_all
+    )
+  print("[+] Construct Path {}".format(force_path))
+  for i in range(len(force_path)-1) :
+    curr_blk = force_path[i]
+    next_blk = force_path[i+1]
+    last_insn = GroundTruth.get_last_insn(blk = curr_blk)
+    if GroundTruth.is_pred_blk(blk = curr_blk) :
+      branches = GroundTruth.get_predicate_branch(insn = last_insn)
+      target = ['T', 'F'][next_blk == branches[1]]
+      new_scheme.append((last_insn, target))
+    elif last_insn in GroundTruth.jmptab:
+      new_scheme.append((last_insn, next_blk))
+    elif last_insn in GroundTruth.calltab :
+      new_scheme.append((last_insn, next_blk))
+
+  return target_debug, new_scheme
+
+def exploitation_mutate(execution, def2use, back_adj, block_distance, depth) :
+  return DUCG_exeuction(execution = execution, def2use = def2use, block_distance = block_distance)
+  candidate_branch, candidate_weight, candidate_pairs = get_weight_of_execution(execution, def2use, back_adj, block_distance, depth)
+  if len(candidate_branch) == 0:
+    return None
+
+  new_scheme = list(execution[0])
+  pivot = weighted_select(candidate_weight)
+
+  new_scheme.append(candidate_branch[pivot])
+  fitness.add(candidate_branch[pivot])
+  print("candidate_weight : ", candidate_weight)
+  print("contributed pairs : ", candidate_pairs[pivot])
+  return new_scheme
+
+def force_execution(execution, succ_closure, depth) :
+  global fitness
+
+  switches = execution.scheme
+  Execution.clear_tmpfile()
+  execution.do_execution()
+
+  if DO_STATS == True:
+    if (succ + fail > 0) and ((succ + fail) % 10 == 0):
+      do_stats()
+
+  Execution.read_mem_tmp(
+    insn_all = GroundTruth.insn_all,
+    i2b = GroundTruth.i2b,
+    DUMP_MEM = DUMP_MEM,
+    depth = depth
+  )
+  print("[+] memory file analyze done !")
+
+  trace_tmp = Execution.read_insn_tmp(
+    insn_all = GroundTruth.insn_all,
+    block_all = GroundTruth.block_all,
+    func_all = GroundTruth.func_all,
+    edge_all = GroundTruth.edge_all,
+    i2b = GroundTruth.i2b,
+    DUMP_INSN = DUMP_INSN
+    )
+
+  Execution.read_cg_tmp(
+    insn_all = GroundTruth.insn_all,
+    func_all = GroundTruth.func_all,
+    i2f = GroundTruth.i2f,
+    DUMP_CG = DUMP_CG
+    )
+
+  is_useful = Execution.read_dep_tmp(
+    insn_all = GroundTruth.insn_all,
+    i2b = GroundTruth.i2b,
+    DUMP_DEP = DUMP_DEP,
+    dep_ground = GroundTruth.dep_ground
+  )
+
+  if DO_GROUND != True and DO_EXPLOIT == True:
+    posterior_analysis(
+      ICFG = GroundTruth.icfg,
+      succ_closure = succ_closure, 
+      call_depth = depth,
+      )
+  Execution.build_inverted_index(trace = set(trace_tmp), DO_KILL = DO_KILL)
+
+  errflags = Execution.is_crash()
+
+  preds = Execution.read_trace(
+    insn_all = GroundTruth.insn_all,
+    jmptab = GroundTruth.jmptab,
+    calltab = GroundTruth.calltab,
+  )
+  for (src, dest) in preds :
+    fitness.add((src, dest))
+    if dest == 'T' or dest == 'F' :
+      branches = GroundTruth.get_predicate_branch(src)
+      Execution.edge_cov.add((GroundTruth.i2b[src], GroundTruth.i2b[branches[dest=='F']]))
+    else :
+      Execution.edge_cov.add((GroundTruth.i2b[src], GroundTruth.i2b[dest]))
+
+  t = switches[-1] if len(switches) > 0 else None
+  preds = trim_pred(preds)
+  index = preds.index(t) if t in preds else -1
+  preds = preds[index+1:]
+  return False, is_useful, preds, trace_tmp
+  return errflags, is_useful, preds, trace_tmp
+
+def exploitation_mode(exec_history, s, def2use, succ_closure, suffixs, block_distance, max_tries, depth) :
+  global worklist
+  global execution_cnt
+  global succ
+  global fail
+  global useful_cnt
+  global selected_times
+
+  global dep_diff
+  global BLACKHOLE
+
+  selected_times = []
+  seed_weights = []
+  contributed_pairs = set()
+
+  pivot = None
+  while max_tries != 0 :
+    while True :
+      if DO_EXPLOIT == True :#and ("parser" not in TARGET):
+        pivot, execution = exploitation_select(exec_history = exec_history, weights = seed_weights)
+        if execution == None :
+          print("[*] No Def-Use !!! Break")
+          return 
+        contributed_pairs, switches = exploitation_mutate(
+          execution = execution, 
+          def2use = def2use, 
+          back_adj = suffixs, 
+          block_distance = block_distance,
+          depth = depth,
+          )
+        if switches is None :
+          if BENCHMARK != "malware":
+            exec_history.pop(pivot)
+          else :
+            switches = random_select_and_mutate(exec_history = exec_history)
+      else :
+        switches = random_select_and_mutate(exec_history = exec_history)
+      if switches is not None : break
+
+    execution_cnt += 1
+    execution = Execution(round_cnt = execution_cnt, scheme = switches, s = s)
+
+    errflags = False
+    is_useful = False
+
+    run_times = 1 #if DO_BDA == True or DO_KILL == False or DO_EXPLOIT == False else 2
+    for i in range(run_times):
+      Execution.set_path_scheme(
+        scheme = execution.scheme,
+        jmptab = GroundTruth.jmptab,
+        calltab = GroundTruth.calltab,
+        loop_all = GroundTruth.loops,
+        BLACKHOLE = BLACKHOLE,# if i == 0 else {},
+        )
+      errflags, is_useful_tmp, preds, trace_tmp = force_execution(execution = execution, succ_closure = succ_closure, depth = depth)
+      is_useful |= is_useful_tmp
+
+    if errflags == False :
+      if len(preds) > 0 :
+        exec_history.append((switches, preds, trace_tmp))
+        schemes, weights, pairs = get_weight_of_execution(
+          execution=exec_history[-1],
+          def2use=def2use,
+          back_adj=suffixs,
+          block_distance=block_distance,
+          depth=depth,
+          )
+        seed_weights.append(max(weights))
+        selected_times.append(0)
+
+    if errflags == False:
+      succ += 1
+    else:
+      fail += 1
+    if is_useful :
+      useful_cnt += 1
+
+    max_tries -= 1
+    dep_recovery = dep_diff.intersection(Execution.dep_blk_cov)
+        
+    for (use, define) in dep_recovery :
+      def2use[define].discard(use)
+    print("len(dep_diff) = {}, dep_recovery = {}".format(len(dep_diff), dep_recovery))
+    if max_tries % 1 == 0 :
+      dep_kill = Execution.kill_misdep(dep_diff = dep_diff, DO_KILL = DO_KILL)
+      if DO_EXPLOIT == True : 
+        if len(dep_recovery) == 0 and (len(dep_kill) == 0):
+          if DO_BDA == False and pivot is not None :
+            exec_history.pop(pivot)
+          dep_tmp = contributed_pairs - dep_recovery
+          for (use, define) in dep_tmp :
+            def2use[define].discard(use)
+          dep_diff = dep_diff - dep_tmp
+      for (use, define) in dep_kill :
+        def2use[define].discard(use)
+      dep_diff = dep_diff - dep_kill
+
+def exploration_mode(s, succ_closure, depth) :
+  global execution_cnt
+  global succ
+  global fail
+  global useful_cnt
+
+  global worklist
+
+  exec_history = []
+  while len(worklist) > 0:
+    switches = worklist[-1][0]
+
+    execution_cnt += 1
+    execution = Execution(round_cnt = execution_cnt, scheme = switches, s = s)
+    Execution.set_path_scheme(
+      scheme = execution.scheme,
+      jmptab = GroundTruth.jmptab,
+      calltab = GroundTruth.calltab,
+      loop_all = GroundTruth.loops,
+      BLACKHOLE = BLACKHOLE,
+      )
+
+    errflags = False
+    is_useful = False
+
+    for i in range(1):
+      errflags, is_useful, preds, trace_tmp = force_execution(execution = execution, succ_closure = succ_closure, depth = depth)
+      ### DEBUG CODE BEGIN
+      # print("[*] exploration useful : %d" % is_useful)
+      ### DEBUG CODE END
+      ''' when dealing with malware, do not care about useful'''
+      if errflags == False and is_useful == True:
+        if len(preds) > 0 :
+          exec_history.append((switches, preds, trace_tmp))
+        worklist[-1][1] = set(preds)
+        break
+
+    if errflags == False :
+      succ += 1
+    else:
+      fail += 1
+
+    if is_useful == True :
+      useful_cnt += 1
+    if worklist[-1][1] is None :
+      worklist.pop()
+
+    new_switches = exploration_select_and_mutate(worklist)
+    if new_switches is None :
+      continue
+    worklist.append([new_switches, None])
+
+    if DO_BDA == True :
+      break
+
+  if DO_STATS == True :
+    do_stats()
+  return exec_history
+
+def dep_guide(DEPGROUND_PATH = None) :
+  global dep_diff
+
+  if DEPGROUND_PATH is not None:
+    GroundTruth.read_dep_ground(DEPGROUND_PATH)
+
+  dep_all = set()
+  ii = 0
+  for (use, define) in GroundTruth.dep_ground :
+    ii += 1
+    if len(GroundTruth.dep_ground) > 40000000 and ii % 100 != 0: # For too large .dep file
+      continue
+    if use not in GroundTruth.i2b or define not in GroundTruth.i2b :
+      continue
+
+    use = GroundTruth.i2b[use]
+    define = GroundTruth.i2b[define]
+    dep_all.add((use, define))
+  dep_covv = set()
+  for use, define in Execution.dep_cov :
+    dep_covv.add((GroundTruth.i2b[use], GroundTruth.i2b[define]))
+  dep_diff = dep_all - dep_covv
+
+  print("len(dep_all)", len(dep_all))
+  print("len(dep_blk_cov)", len(dep_covv))
+  print("len(dep_diff)", len(dep_diff))
+
+  def2use = {}
+  for use, define in dep_diff :
+    if define not in def2use : 
+      def2use[define] = set()
+    def2use[define].add(use)
+  print(len(def2use))
+  if DEPGROUND_PATH is not None:
+    GroundTruth.read_dep_ground()
+  return def2use
+
+def dynamic_guide() :
+  global dep_diff
+
+  WM2B = reverse_graph(Execution.GBlk2MemWrite)
+  RM2B = reverse_graph(Execution.GBlk2MemRead)
+  dep_all = set()
+  for def_mem in WM2B :
+    if def_mem not in RM2B : 
+      continue
+    for def_state in WM2B[def_mem] :
+      for use_state in RM2B[def_mem] :
+        dep_all.add((use_state[1], def_state[1]))
+
+  if DO_COMPARE == True:
+    dep_ground = set()
+    for (use, define) in GroundTruth.dep_ground :
+      use = GroundTruth.i2b[use]
+      define = GroundTruth.i2b[define]
+      dep_ground.add((use, define))
+    dep_all = dep_all.intersection(dep_ground)
+  dep_diff = dep_all - Execution.dep_blk_cov 
+
+  dep_kill = Execution.kill_misdep(dep_diff = dep_diff, DO_KILL = DO_KILL)
+  dep_diff = dep_diff - dep_kill
+
+  def2use = {}
+  for use, define in dep_diff :
+    if define not in def2use : 
+      def2use[define] = set()
+    def2use[define].add(use)
+  print("len(dep_diff)", len(dep_diff))
+  return def2use
+
+def explore_random_fork():
+  global execution_cnt
+  global succ
+  global fail
+  global starttime
+  global useful_cnt
+  global worklist
+  global fitness
+  global PS
+
+  global dep_diff
+
+  os.mkdir(DATA)
+  os.mkdir(ERROR)
+  os.mkdir(BUG)
+
+  GroundTruth.do_analysis(analysis_sh=RUNANALYSIS)
+
+  if DO_COMPARE == True:
+    GroundTruth.read_type()
+    GroundTruth.read_dep_ground()
+
+  GroundTruth.do_find_loop()
+
+  execution_cnt = 0
+  succ = 0
+  fail = 0
+  starttime = time.time()
+  useful_cnt = 0
+  worklist = deque([ [[], None] ])
+  fitness = set()
+  def2use = {}
+  CONTEXT_DEP = 0
+  PS = {}
+  succ_closure = {}
+
+  block_distance = get_distance()
+  print("[INFO] get_distance() done !")
+
+  suffixs = {}
+  all_stats = get_key_succ_closure(
+    key = ("main", GroundTruth.main),
+    ICFG = GroundTruth.icfg,
+    call_depth = CONTEXT_DEP,
+    succ_closure = succ_closure,
+    LIMIT = -1,
+    )
+  print(len(all_stats))
+  xx = 0
+  ss = 0
+  for stat in all_stats :
+    if DO_GROUND == True or DO_EXPLOIT == False : continue
+    succ_closure[stat] = get_key_succ_closure(
+      key = stat, 
+      ICFG = GroundTruth.icfg, 
+      call_depth = CONTEXT_DEP, 
+      succ_closure = succ_closure,
+      LIMIT = 20,
+     )
+    xx += 1
+    ss += len(succ_closure[stat])
+    if xx % 10 == 0 : print("round = %d, %lf" % (xx, 1.0*ss/xx))
+
+  subprocess.Popen(RUNRANDOM, shell=True)
+  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+  while True:
+    try:
+      print ("try connect")
+      s.connect(('localhost', 2018))
+      break
+    except:
+      time.sleep(1)
+      pass
+  print ("Server is Ready\n")
+
+  exec_history = exploration_mode(
+    s = s,
+    succ_closure = succ_closure,
+    depth = CONTEXT_DEP,
+    )
+
+  if DO_BDA == True :
+    BDA_DEP = os.environ.get("DEP_PATH")
+    if (BDA_DEP is None) or (len(BDA_DEP) == 0) :
+      print ("[ERROR] please provide dependency file when testing bda*")
+      exit(1)
+    def2use = dep_guide(BDA_DEP)
+  else :
+    def2use = dynamic_guide()
+
+  if DO_BDA == False :
+    MAGIC_MAP = {
+      'gzip' : 300, 'bzip2' : 100, "mcf" : 100,
+      "vortex" : 1500, "eon" : 500, "crafty" : 1000,
+      "perlbmk" : 2300, "gap" : 2000, "gcc" : 2000, 
+      "twolf" : 1000, "vpr" : 500, "parser" : 1000}
+  else :
+    MAGIC_MAP = {'gzip' : 300, 'bzip2' : 300, "mcf" : 130, "vortex" : 6000, "eon" : 500, "crafty" : 2000, "twolf" : 2900, "perlbmk" : 6000, "gap" : 8000, "gcc" : 8000}
+
+  BIN_NAME = TARGET[TARGET.rindex('/')+1:]
+  exp_cnt = 2000
+  if BIN_NAME in MAGIC_MAP :
+    exp_cnt = MAGIC_MAP[BIN_NAME]
+  exploitation_mode(
+    exec_history = exec_history, 
+    s = s, 
+    def2use = def2use, 
+    block_distance = block_distance,
+    succ_closure = succ_closure, 
+    max_tries = exp_cnt,
+    depth = CONTEXT_DEP,
+    suffixs = suffixs
+    )
+
+  s.shutdown(socket.SHUT_RDWR)
+  s.close()
+
+  if DUMP_DEP == True:
+    Execution.write_dep_cov()
+
+  if DO_STATS == True:
+    do_stats(is_last=True)
+
+def trim_pred(preds) :
+  pred_set = set()
+  _preds = []
+  for pred in preds :
+    if (pred[0] in GroundTruth.insn_all) and (pred not in pred_set) :
+      _preds.append(pred)
+      pred_set.add(pred)
+  return _preds
+
+def do_stats(is_last=False):
+  insn_cov = Execution.insn_cov
+  block_cov = Execution.block_cov
+  func_cov = Execution.func_cov
+  edge_cov = Execution.edge_cov
+  dep_cov = Execution.dep_cov
+
+  insn_all = GroundTruth.insn_all
+  block_all = GroundTruth.block_all
+  func_all = GroundTruth.func_all
+  edge_all = GroundTruth.edge_all
+
+  STATS = "%s/stats" % DATA
+
+  if not os.path.exists(STATS):
+    with open(STATS, "a+") as f:
+      line = "time\texec\tuseful\tcov_insn\tcov_block\tcov_edge\t# refer\tmem_dep\tdep_correct\tmiss_rate\textra\tdep_mistyped\tfitness\twklist\ttimestamp\n"
+      f.write(line)
+
+  insn_uncov = insn_all.difference(insn_cov)
+  func_fullcov = func_all.copy()
+  for insn_addr in insn_uncov:
+    func_fullcov.discard(GroundTruth.i2f[insn_addr])
+
+  with open(STATS, "a+") as f:
+
+    if DO_COMPARE == True:
+      (intersection, difference, mistyped) = GroundTruth.compare_dep(alpha_deps=dep_cov)
+      line = "%d\t%d\t%d(%.2f%%)\t%d/%d(%.0f%%)\t%d/%d(%.0f%%)\t%d/%d(%.0f%%)\t%d\t%d\t%d(%.0f%%)\t%d(%.2f%%)\t%d\t%d(%.2f%%)\t%d\t%d\t%d\n" % \
+             (time.time()-starttime, execution_cnt, useful_cnt, float(useful_cnt)/float(execution_cnt)*100, \
+             len(insn_cov), len(insn_all), float(len(insn_cov))/float(len(insn_all))*100, \
+             len(block_cov), len(block_all), float(len(block_cov))/float(len(block_all))*100, \
+             len(edge_cov), len(edge_all), float(len(edge_cov))/float(len(edge_all))*100, \
+             len(GroundTruth.dep_ground), \
+             len(dep_cov), intersection, float(intersection)/float(len(dep_cov))*100, \
+             len(GroundTruth.dep_ground) - intersection, float(len(GroundTruth.dep_ground) - intersection) / float(len(GroundTruth.dep_ground))*100,
+             difference,
+              mistyped, float(mistyped)/float(len(dep_cov))*100, \
+             len(fitness), len(worklist), int(time.time()))
+    else:
+      line = "%d\t%d\t%d\t%d(%.0f%%)\t%d/%d(%.0f%%)\t%d/%d(%.0f%%)\t%d/%d(%.0f%%)\t%d/%d(%.0f%%)\t%d\tN/A\tN/A\t%d\t%d\t%d\n" % \
+           (time.time()-starttime, execution_cnt, execution_cnt-fail, fail, float(fail)/float(execution_cnt)*100, \
+           len(insn_cov), len(insn_all), float(len(insn_cov))/float(len(insn_all))*100, \
+           len(block_cov), len(block_all), float(len(block_cov))/float(len(block_all))*100, \
+           len(func_cov), len(func_all), float(len(func_cov))/float(len(func_all))*100, \
+           len(func_fullcov), len(func_all), float(len(func_fullcov))/float(len(func_all))*100, \
+           len(dep_cov),
+           len(fitness), len(worklist), int(time.time()))
+    f.write(line)
+
+if __name__ == "__main__":
+  main()

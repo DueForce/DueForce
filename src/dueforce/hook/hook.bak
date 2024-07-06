@@ -1,0 +1,73 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <string.h>
+#include <malloc.h>
+
+static void __hook_init(void) __attribute__((constructor));
+static FILE* (*real_fopen)(const char*, const char*);
+static void* (*real_malloc)(size_t bytes);
+static void* (*real_memcpy)(void*, const void*, size_t);
+static void (*real_free)(void*);
+
+
+FILE* fopen(const char *filename, const char *mode) {
+
+  printf("uv fopen\n");
+
+  if (access(filename, F_OK) == -1 && strchr(mode, 'r') != NULL) {
+    char padding[128];
+    sprintf(padding, "%s/rpadding", getenv("ROOT"));  
+    printf("redirect file %s to: %s\n", filename, padding);
+    return real_fopen(filename, mode);
+  }
+
+  return real_fopen(filename, mode);
+
+}
+
+
+void* memcpy(void *dstpp, const void *srcpp, size_t len) {
+
+  //printf("uv memcpy: %p %p %d\n", dstpp, srcpp, len);
+  return real_memcpy(dstpp, srcpp, len);
+
+}
+
+
+void free(void *ptr) {
+  //printf("free: %p\n", ptr);
+  return real_free(ptr);
+}
+
+
+/*
+void* malloc(size_t bytes) {
+
+  if (real_malloc == NULL) {
+    __hook_init();
+  }
+
+  //printf("uv malloc\n");
+
+//  void *ret = real_malloc(bytes);
+  //for (size_t i = 0; i < bytes; i++) *(char*)(ret+i) = 0;
+  
+  return real_malloc(bytes);
+
+}
+*/
+
+static void __hook_init(void) {
+
+  //printf("hi\n");
+  void *handle = dlopen("libc.so.6", RTLD_LAZY);
+  real_fopen = dlsym(handle, "fopen");
+  real_malloc = dlsym(handle, "malloc");
+  real_free = dlsym(handle, "free");
+  real_memcpy = dlsym(handle, "memcpy");
+  printf("handle: %p %p %p\n", real_fopen, real_malloc, real_free);
+
+}
+

@@ -1,14 +1,15 @@
 # DueForce
 
-## Overview
+Docker repository for "Define-Use Guided Path Exploration for Better Forced Execution" (in *ISSTA'24*). Please refer to the [paper](https://www.youwei.site/papers/ISSTA2024.pdf) for technical details.
 
-Repo for "Define-Use Guided Path Exploration for Better Forced Execution" (in ISSTA'2024). The code will be ready soon.
+
 
 ## Architecture 
 
 <img src="img/arch.png" alt="image-20231221215939453" style="zoom:50%;" />
 
-## Components 
 
-- `MalwareAnalysis.pdf`: details of malware analysis result
-- `DueForce.pdf`: camere-ready version of the paper
+
+## Pre-compiled Docker 
+
+Referred to [artifact](https://zenodo.org/records/12669304) for details.
